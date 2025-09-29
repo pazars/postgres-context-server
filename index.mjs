@@ -1,44 +1,29 @@
 #!/usr/bin/env node
 
 /**
- * PostgreSQL Schema Model Context Protocol (MCP) Server
+ * PostgreSQL Schema Model Context Protocol (MCP) Server (Updated for v1.18.2)
  *
  * This MCP server provides schema-only access to PostgreSQL databases.
  * It allows clients to discover and read database table schemas without
  * executing queries or modifying data.
  *
- * MCP Server Creation Workflow:
- * 1. Initialize Server instance with name and version
+ * MCP Server Creation Workflow (v1.18.2):
+ * 1. Initialize McpServer instance with name and version
  * 2. Set up database connection pool
- * 3. Register request handlers for different MCP operations:
- *    - ListResources: Discover available database tables
- *    - ReadResource: Get schema information for specific tables
- *    - ListTools: Advertise available tools (pg-schema)
- *    - CallTool: Execute the pg-schema tool
- *    - ListPrompts: Advertise available prompts
- *    - GetPrompt: Execute prompts for schema retrieval
- *    - Complete: Provide auto-completion for table names
+ * 3. Register resources, tools, and prompts using the new simplified API
  * 4. Connect server to transport layer (stdio)
  * 5. Start the server
  */
 
 import pg from "pg";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ListPromptsRequestSchema,
-  ListToolsRequestSchema,
-  ReadResourceRequestSchema,
-  GetPromptRequestSchema,
-  CompleteRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 // Step 1: Initialize the MCP Server with metadata
-const server = new Server({
+const server = new McpServer({
   name: "postgres-context-server",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // Step 2: Set up database connection and validation
@@ -66,158 +51,119 @@ const SCHEMA_PROMPT_NAME = "pg-schema"; // Name of the schema prompt
 const ALL_TABLES = "all-tables";        // Special identifier for all tables mode
 
 /**
- * Step 3a: ListResources Handler
+ * Step 3a: Register Dynamic Schema Resources
  *
- * This handler responds to requests for available resources.
- * In MCP, resources are addressable pieces of content that can be read.
- * Here, each database table is exposed as a resource containing its schema.
- *
- * Returns: Array of resource objects with URI, mimeType, and human-readable name
+ * Using the new ResourceTemplate API to register dynamic schema resources.
+ * Each database table is exposed as a resource containing its schema.
  */
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const client = await pool.connect();
-  try {
-    // Query all tables in the public schema
-    const result = await client.query(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
-    );
-    return {
-      resources: result.rows.map((row) => ({
-        uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href,
-        mimeType: "application/json",
-        name: `"${row.table_name}" database schema`,
-      })),
-    };
-  } finally {
-    client.release();
+server.registerResource(
+  "table-schema",
+  new ResourceTemplate("postgres://{host}/{tableName}/schema"),
+  {
+    title: "PostgreSQL Table Schema",
+    description: "Schema information for PostgreSQL database tables",
+    mimeType: "application/json"
+  },
+  async (uri, { host, tableName }) => {
+    const client = await pool.connect();
+    try {
+      // Get column information for the specific table
+      const result = await client.query(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1",
+        [tableName],
+      );
+
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(result.rows, null, 2),
+          },
+        ],
+      };
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 /**
- * Step 3b: ReadResource Handler
+ * Step 3b: Register List Resource Handler
  *
- * This handler reads the content of a specific resource identified by URI.
- * It parses the URI to extract the table name and returns the table's
- * column information as JSON.
- *
- * URI format: postgres://host/table_name/schema
- * Returns: JSON containing column names and data types
+ * This provides a way to list all available table schemas.
  */
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const resourceUrl = new URL(request.params.uri);
+server.registerResource(
+  "tables-list",
+  "postgres://tables/list",
+  {
+    title: "Available PostgreSQL Tables",
+    description: "List of all available PostgreSQL tables in the public schema",
+    mimeType: "application/json"
+  },
+  async (uri) => {
+    const client = await pool.connect();
+    try {
+      // Query all tables in the public schema
+      const result = await client.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+      );
+      
+      const tables = result.rows.map((row) => ({
+        table_name: row.table_name,
+        schema_uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href
+      }));
 
-  // Parse URI to extract table name and validate path
-  const pathComponents = resourceUrl.pathname.split("/");
-  const schema = pathComponents.pop();
-  const tableName = pathComponents.pop();
-
-  if (schema !== SCHEMA_PATH) {
-    throw new Error("Invalid resource URI");
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(tables, null, 2),
+          },
+        ],
+      };
+    } finally {
+      client.release();
+    }
   }
-
-  const client = await pool.connect();
-  try {
-    // Get column information for the specific table
-    const result = await client.query(
-      "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1",
-      [tableName],
-    );
-
-    return {
-      contents: [
-        {
-          uri: request.params.uri,
-          mimeType: "application/json",
-          text: JSON.stringify(result.rows, null, 2),
-        },
-      ],
-    };
-  } finally {
-    client.release();
-  }
-});
+);
 
 /**
- * Step 3c: ListTools Handler
+ * Step 3c: Register PostgreSQL Schema Tool
  *
- * This handler advertises the tools available to MCP clients.
- * Tools are executable functions that clients can call to perform operations.
- * Here we expose the "pg-schema" tool for retrieving database schemas.
- *
- * Returns: Array of tool definitions with names, descriptions, and input schemas
+ * Using the new registerTool API with Zod schema validation.
+ * This tool generates formatted SQL CREATE TABLE statements.
  */
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+server.registerTool(
+  "pg-schema",
+  {
+    title: "PostgreSQL Schema Tool",
+    description: "Returns the schema for a Postgres database table or all tables",
+    inputSchema: z.object({
+      mode: z.enum(["all", "specific"]).describe("Mode of schema retrieval"),
+      tableName: z.string().optional().describe("Name of the specific table (required if mode is 'specific')")
+    }).refine(
+      (data) => data.mode !== "specific" || data.tableName,
       {
-        name: "pg-schema",
-        description: "Returns the schema for a Postgres database.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            mode: {
-              type: "string",
-              enum: ["all", "specific"],
-              description: "Mode of schema retrieval",
-            },
-            tableName: {
-              type: "string",
-              description:
-                "Name of the specific table (required if mode is 'specific')",
-            },
-          },
-          required: ["mode"],
-          // Conditional validation: tableName required when mode is "specific"
-          if: {
-            properties: { mode: { const: "specific" } },
-          },
-          then: {
-            required: ["tableName"],
-          },
-        },
-      },
-    ],
-  };
-});
-
-/**
- * Step 3d: CallTool Handler
- *
- * This handler executes tools when called by MCP clients.
- * It processes the "pg-schema" tool to generate formatted SQL schema
- * representations for either specific tables or all tables.
- *
- * Returns: Text content containing SQL CREATE TABLE statements
- */
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === "pg-schema") {
-    const mode = request.params.arguments?.mode;
-
-    // Determine which table(s) to process based on mode
-    const tableName = (() => {
-      switch (mode) {
-        case "specific": {
-          const tableName = request.params.arguments?.tableName;
-
-          if (typeof tableName !== "string" || tableName.length === 0) {
-            throw new Error(`Invalid tableName: ${tableName}`);
-          }
-
-          return tableName;
-        }
-        case "all": {
-          return ALL_TABLES;
-        }
-        default:
-          throw new Error(`Invalid mode: ${mode}`);
+        message: "tableName is required when mode is 'specific'",
+        path: ["tableName"]
       }
-    })();
-
+    )
+  },
+  async ({ mode, tableName }) => {
     const client = await pool.connect();
 
     try {
+      // Determine which table(s) to process based on mode
+      const targetTable = mode === "specific" ? tableName : ALL_TABLES;
+      
+      if (mode === "specific" && (!tableName || tableName.trim().length === 0)) {
+        throw new Error("Invalid tableName: tableName is required for 'specific' mode");
+      }
+
       // Generate formatted SQL schema using utility function
-      const sql = await getSchema(client, tableName);
+      const sql = await getSchema(client, targetTable);
 
       return {
         content: [{ type: "text", text: sql }],
@@ -226,99 +172,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       client.release();
     }
   }
-
-  throw new Error("Tool not found");
-});
+);
 
 /**
- * Step 3e: Complete Handler
+ * Step 3d: Register PostgreSQL Schema Prompt
  *
- * This handler provides auto-completion suggestions for prompt arguments.
- * It helps users discover available table names when using the pg-schema prompt.
- *
- * Returns: Array of completion values (table names + "all-tables" option)
+ * Using the new registerPrompt API for generating schema prompts.
  */
-server.setRequestHandler(CompleteRequestSchema, async (request) => {
-  process.stderr.write("Handling completions/complete request\n");
-
-  if (request.params.ref.name === SCHEMA_PROMPT_NAME) {
-    const tableNameQuery = request.params.argument.value;
-    // Check if user has already entered multiple words (completion not needed)
-    const alreadyHasArg = /\S*\s/.test(tableNameQuery);
-
-    if (alreadyHasArg) {
-      return {
-        completion: {
-          values: [],
-        },
-      };
-    }
-
-    const client = await pool.connect();
-    try {
-      // Get all available table names for completion
-      const result = await client.query(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
-      );
-      const tables = result.rows.map((row) => row.table_name);
-      return {
-        completion: {
-          values: [ALL_TABLES, ...tables], // Include "all-tables" option first
-        },
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  throw new Error("unknown prompt");
-});
-
-/**
- * Step 3f: ListPrompts Handler
- *
- * This handler advertises available prompts to MCP clients.
- * Prompts are pre-defined templates that clients can use to generate
- * contextual information. Here we expose the "pg-schema" prompt.
- *
- * Returns: Array of prompt definitions with names, descriptions, and arguments
- */
-server.setRequestHandler(ListPromptsRequestSchema, async () => {
-  process.stderr.write("Handling prompts/list request\n");
-
-  return {
-    prompts: [
+server.registerPrompt(
+  SCHEMA_PROMPT_NAME,
+  {
+    title: "PostgreSQL Schema Prompt",
+    description: "Retrieve the schema for a given table in the postgres database",
+    arguments: [
       {
-        name: SCHEMA_PROMPT_NAME,
-        description:
-          "Retrieve the schema for a given table in the postgres database",
-        arguments: [
-          {
-            name: "tableName",
-            description: "the table to describe",
-            required: true,
-          },
-        ],
+        name: "tableName",
+        description: "The table to describe (or 'all-tables' for all tables)",
+        required: true,
       },
     ],
-  };
-});
-
-/**
- * Step 3g: GetPrompt Handler
- *
- * This handler executes prompts and returns formatted messages for MCP clients.
- * It generates schema information as conversational context that can be
- * used in AI model interactions.
- *
- * Returns: Prompt response with description and formatted messages
- */
-server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-  process.stderr.write("Handling prompts/get request\n");
-
-  if (request.params.name === SCHEMA_PROMPT_NAME) {
-    const tableName = request.params.arguments?.tableName;
-
+  },
+  async ({ tableName }) => {
     if (typeof tableName !== "string" || tableName.length === 0) {
       throw new Error(`Invalid tableName: ${tableName}`);
     }
@@ -332,8 +206,8 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       return {
         description:
           tableName === ALL_TABLES
-            ? "all table schemas"
-            : `${tableName} schema`,
+            ? "All PostgreSQL table schemas"
+            : `PostgreSQL schema for table: ${tableName}`,
         messages: [
           {
             role: "user",
@@ -348,9 +222,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       client.release();
     }
   }
-
-  throw new Error(`Prompt '${request.params.name}' not implemented`);
-});
+);
 
 /**
  * Utility Function: getSchema
@@ -371,13 +243,21 @@ async function getSchema(client, tableNameOrAll) {
   if (tableNameOrAll === ALL_TABLES) {
     // Get columns for all user tables (exclude system schemas)
     result = await client.query(
-      `${select} WHERE table_schema NOT IN ('pg_catalog', 'information_schema')`,
+      `${select} WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_name, ordinal_position`,
     );
   } else {
     // Get columns for a specific table
-    result = await client.query(`${select} WHERE table_name = $1`, [
+    result = await client.query(`${select} WHERE table_name = $1 ORDER BY ordinal_position`, [
       tableNameOrAll,
     ]);
+  }
+
+  if (result.rows.length === 0) {
+    if (tableNameOrAll === ALL_TABLES) {
+      return "```sql\n-- No tables found in the database\n```";
+    } else {
+      return `\`\`\`sql\n-- Table '${tableNameOrAll}' not found\n\`\`\``;
+    }
   }
 
   // Extract unique table names and sort them
@@ -395,14 +275,14 @@ async function getSchema(client, tableNameOrAll) {
 
     // Generate CREATE TABLE statement for this table
     sql += [
-      `create table "${tableName}" (`,
+      `CREATE TABLE "${tableName}" (`,
       result.rows
         .filter((row) => row.table_name === tableName)
         .map((row) => {
           // Format column definition with data type, nullability, and defaults
-          const notNull = row.is_nullable === "NO" ? " not null" : "";
+          const notNull = row.is_nullable === "NO" ? " NOT NULL" : "";
           const defaultValue =
-            row.column_default != null ? ` default ${row.column_default}` : "";
+            row.column_default != null ? ` DEFAULT ${row.column_default}` : "";
           return `    "${row.column_name}" ${row.data_type}${notNull}${defaultValue}`;
         })
         .join(",\n"),
@@ -424,10 +304,24 @@ async function getSchema(client, tableNameOrAll) {
 async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  process.stderr.write("PostgreSQL MCP server started successfully\n");
 }
 
 // Step 5: Start the server with error handling
 runServer().catch((error) => {
   console.error("Failed to start MCP server:", error);
   process.exit(1);
+});
+
+// Graceful shutdown handling
+process.on('SIGINT', async () => {
+  process.stderr.write("Shutting down server...\n");
+  await pool.end();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  process.stderr.write("Shutting down server...\n");
+  await pool.end();
+  process.exit(0);
 });

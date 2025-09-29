@@ -1,28 +1,13 @@
 {
-  "name": "@zeddotdev/postgres-context-server",
-  "version": "0.1.5",
-  "description": "a model context protocol server for postgres schema access",
-  "main": "index.mjs",
+  "name": "postgres-mcp-server",
+  "version": "0.2.0",
   "type": "module",
-  "publishConfig": {
-    "access": "public"
-  },
-  "files": [
-    "vendor",
-    "index.mjs"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/zed-industries/postgres-context-server.git"
-  },
-  "author": "",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/zed-industries/postgres-context-server/issues"
-  },
-  "homepage": "https://github.com/zed-industries/postgres-context-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.2",
-    "pg": "^8.13.1"
+    "pg": "^8.11.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.10.0"
   }
 }
